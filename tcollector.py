@@ -62,6 +62,7 @@ ALIVE = True
 MAX_UNCAUGHT_EXCEPTIONS = 100
 DEFAULT_PORT = 4242
 MAX_REASONABLE_TIMESTAMP = 2209212000  # Good until Tue  3 Jan 14:00:00 GMT 2040
+MAX_REASONABLE_TIMESTAMP_MS = MAX_REASONABLE_TIMESTAMP * 1000
 # How long to wait for datapoints before assuming
 # a collector is dead and restarting it
 ALLOWED_INACTIVITY_TIME = 600  # seconds
@@ -351,14 +352,15 @@ class ReaderThread(threading.Thread):
             col.lines_invalid += 1
             return
         metric, timestamp, value, tags = parsed.groups()
+        timestamp = int(timestamp)
 
         # If there are more than 11 digits we're dealing with a timestamp
         # with millisecond precision
-        max_timestamp = MAX_REASONABLE_TIMESTAMP
-        if len(timestamp) > 11:
-            max_timestamp = MAX_REASONABLE_TIMESTAMP * 1000
+        if len(str(timestamp)) > 11:
+            global MAX_REASONABLE_TIMESTAMP, MAX_REASONABLE_TIMESTAMP_MS
+            MAX_REASONABLE_TIMESTAMP = MAX_REASONABLE_TIMESTAMP_MS
 
-        timestamp = int(timestamp)
+        
 
         # De-dupe detection...  To reduce the number of points we send to the
         # TSD, we suppress sending values of metrics that don't change to
@@ -432,7 +434,8 @@ class SenderThread(threading.Thread):
 
     def __init__(self, reader, dryrun, hosts, self_report_stats, tags,
                  reconnectinterval=0, http=False, http_username=None,
-                 http_password=None, http_api_path=None, ssl=False, maxtags=8):
+                 http_password=None, http_api_path=None, ssl=False, maxtags=8,
+                 ns_prefix=None):
         """Constructor.
 
         Args:
@@ -471,6 +474,7 @@ class SenderThread(threading.Thread):
         self.sendq = []
         self.self_report_stats = self_report_stats
         self.maxtags = maxtags # The maximum number of tags TSD will accept.
+        self.ns_prefix = ns_prefix or ''
 
     def pick_connection(self):
         """Picks up a random host/port connection."""
@@ -531,6 +535,7 @@ class SenderThread(threading.Thread):
 
                 if ALIVE:
                     self.send_data()
+
                 errors = 0  # We managed to do a successful iteration.
             except (ArithmeticError, EOFError, EnvironmentError, LookupError,
                     ValueError) as e:
@@ -707,11 +712,11 @@ class SenderThread(threading.Thread):
         # in case of logging we use less efficient variant
         if LOG.level == logging.DEBUG:
             for line in self.sendq:
-                line = "put %s" % self.add_tags_to_line(line)
+                line = "put %s%s" % (self.ns_prefix, self.add_tags_to_line(line))
                 out += line + "\n"
                 LOG.debug('SENDING: %s', line)
         else:
-            out = "".join("put %s\n" % self.add_tags_to_line(line) for line in self.sendq)
+            out = "".join("put %s%s\n" % (self.ns_prefix, (self.add_tags_to_line(line) for line in self.sendq)))
 
         if not out:
             LOG.debug('send_data no data?')
@@ -742,10 +747,7 @@ class SenderThread(threading.Thread):
             protocol = "https"
         else:
             protocol = "http"
-        details=""
-        if LOG.level == logging.DEBUG:
-            details="?details"
-        return "%s://%s:%s/%s%s" % (protocol, self.host, self.port, self.http_api_path, details)
+        return "%s://%s:%s/%s?details" % (protocol, self.host, self.port, self.http_api_path)
 
     def send_data_via_http(self):
         """Sends outstanding data in self.sendq to TSD in one HTTP API call."""
@@ -765,7 +767,7 @@ class SenderThread(threading.Thread):
                 (tag_key, tag_value) = tag.split("=", 1)
                 metric_tags[tag_key] = tag_value
             metric_entry = {}
-            metric_entry["metric"] = metric
+            metric_entry["metric"] = self.ns_prefix+metric
             metric_entry["timestamp"] = int(timestamp)
             metric_entry["value"] = float(value)
             metric_entry["tags"] = dict(self.tags).copy()
@@ -797,6 +799,7 @@ class SenderThread(threading.Thread):
         try:
             response = urlopen(req, json.dumps(metrics))
             LOG.debug("Received response %s %s", response.getcode(), response.read().rstrip('\n'))
+
             # clear out the sendq
             self.sendq = []
             # print "Got response code: %s" % response.getcode()
@@ -804,11 +807,39 @@ class SenderThread(threading.Thread):
             # for line in response:
             #     print line,
             #     print
-        except HTTPError as e:
-            LOG.error("Got error %s %s", e, e.read().rstrip('\n'))
-            # for line in http_error:
-            #   print line,
+        except urllib2.HTTPError as e:
 
+            if e.code != 400:
+                LOG.error("Got HTTP error %s %s - will retry send", e, e.read().rstrip('\n'))
+                return
+
+            LOG.error("HTTP error 400 - some datapoints rejected")
+
+            try:
+                info = json.loads(e.read().rstrip('\n'))
+            except ValueError:
+                # Can't determine the failure - report everything
+                info = {
+                        'errors': [{ 'datapoint': m, 'error':'Unknown'} for m in metrics],
+                        'failed': 'Unknown',
+                        'success': 'Unknown'
+                        }
+                LOG.error("Server did not provide error details")
+
+            LOG.error("Data points accepted: %s/%d rejected: %s/%d",
+                         info['success'], len(metrics),
+                         info['failed'], len(metrics)
+                )
+            for m in info['errors']:
+                LOG.error("Rejected: %s", json.dumps(m))
+
+            # Some were accepted, some were rejected.  No point retrying any.
+
+            self.sendq = []
+
+        except urllib2.URLError, e:
+            # This can happen if there is a DNS, or service discovery issue
+            LOG.error("Got URL error %s", e)
 
 def setup_logging(logfile=DEFAULT_LOG, max_bytes=None, backup_count=None):
     """Sets up logging and associated handlers."""
@@ -956,6 +987,8 @@ def parse_cmdline(argv):
                       help='Password to use for HTTP Basic Auth when sending the data via HTTP')
     parser.add_option('--ssl', dest='ssl', action='store_true', default=defaults['ssl'],
                       help='Enable SSL - used in conjunction with http')
+    parser.add_option('--namespace-prefix', dest='namespace_prefix', default=None,
+                      help='Prefix to prepend to all metric names collected', type=str)
     (options, args) = parser.parse_args(args=argv[1:])
     if options.dedupinterval < 0:
         parser.error('--dedup-interval must be at least 0 seconds')
@@ -967,8 +1000,13 @@ def parse_cmdline(argv):
     # We cannot write to stdout when we're a daemon.
     if (options.daemonize or options.max_bytes) and not options.backup_count:
         options.backup_count = 1
-    return (options, args)
 
+    prefix = options.namespace_prefix
+    if prefix and not prefix.endswith('.'):
+        prefix += '.'
+        options.namespace_prefix = prefix
+
+    return (options, args)
 
 def daemonize():
     """Performs the necessary dance to become a background daemon."""
@@ -1083,7 +1121,8 @@ def main(argv):
     sender = SenderThread(reader, options.dryrun, options.hosts,
                           not options.no_tcollector_stats, tags, options.reconnectinterval,
                           options.http, options.http_username,
-                          options.http_password, options.http_api_path, options.ssl, options.maxtags)
+                          options.http_password, options.http_api_path, options.ssl, options.maxtags,
+                          ns_prefix=options.namespace_prefix)
     sender.start()
     LOG.info('SenderThread startup complete')
 
@@ -1378,7 +1417,7 @@ def spawn_collector(col):
     # other logic and it makes no sense to update the last spawn time if the
     # collector didn't actually start.
     col.lastspawn = int(time.time())
-    # Without setting last_datapoint here, a long running check (>15s) will be 
+    # Without setting last_datapoint here, a long running check (>15s) will be
     # killed by check_children() the first time check_children is called.
     col.last_datapoint = col.lastspawn
     set_nonblocking(col.proc.stdout.fileno())
