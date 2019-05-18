@@ -352,6 +352,13 @@ class ReaderThread(threading.Thread):
             col.lines_invalid += 1
             return
         metric, timestamp, value, tags = parsed.groups()
+        try:
+            # The regex above is fairly open, and would leave values like 'True' through
+            testvalue = float(value)
+        except:
+            LOG.warning('%s sent invalid value: %s', col.name, line)
+            col.lines_invalid += 1
+            return
         timestamp = int(timestamp)
 
         # If there are more than 11 digits we're dealing with a timestamp
